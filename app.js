@@ -378,6 +378,27 @@
   const RECOVERY_EMAIL_KEY = 'recovery_email';
   const EMAILJS_CONFIG_KEY = 'emailjs_config';
 
+  // ---- Stay signed in ----
+  const SESSION_KEY = 'deni_book_session';
+  const AUTO_LOCK_MINUTES = 30;   // change this number to stay signed in longer or shorter
+  const AUTO_LOCK_MS = AUTO_LOCK_MINUTES * 60 * 1000;
+  let lastStamp = 0;
+
+  function touchSession(force){
+    const now = Date.now();
+    if(!force && now - lastStamp < 15000) return; // save at most every 15 seconds
+    lastStamp = now;
+    localStorage.setItem(SESSION_KEY, String(now));
+  }
+  function sessionValid(){
+    const t = Number(localStorage.getItem(SESSION_KEY) || 0);
+    return !!t && (Date.now() - t) < AUTO_LOCK_MS;
+  }
+  function clearSession(){
+    localStorage.removeItem(SESSION_KEY);
+    lastStamp = 0;
+  }
+
   const authView = document.getElementById('authView');
   const authForm = document.getElementById('authForm');
   const authTitle = document.getElementById('authTitle');
@@ -511,6 +532,7 @@
   });
 
   function unlockApp(){
+    touchSession(true);
     authView.classList.add('a-gone');
     authPassword.value = '';
     authPassword.type = 'password';
@@ -519,6 +541,7 @@
   }
 
   function lockApp(){
+    clearSession();
     authView.classList.remove('a-gone');
     initAuth();
   }
@@ -925,6 +948,20 @@
   });
 
   initAuth();
+  if(sessionValid()) unlockApp();   // still signed in from a moment ago
+
+  // keep the session alive while the app is being used
+  ['click','touchstart','keydown','scroll'].forEach(ev =>
+    document.addEventListener(ev, ()=>{ if(authView.classList.contains('a-gone')) touchSession(false); }, { passive:true })
+  );
+
+  // lock only after the app has been idle (or closed) longer than AUTO_LOCK_MINUTES
+  function checkAutoLock(){
+    if(authView.classList.contains('a-gone') && !sessionValid()) lockApp();
+  }
+  setInterval(checkAutoLock, 30000);
+  document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) checkAutoLock(); });
+
   loadPeople();
 
 })();
