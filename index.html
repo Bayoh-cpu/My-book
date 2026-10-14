@@ -96,16 +96,60 @@
 
 <div id="app">
   <header>
-    <div class="title-row">
-      <h1>Deni Book</h1>
-      <div style="display:flex; align-items:center; gap:10px;">
-        <button class="header-icon-btn" id="changePinBtn" aria-label="Settings" title="Settings">⚙</button>
-        <span class="sub" id="dateNow"></span>
+  <html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dashboard</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- HEADER -->
+  <header class="top">
+    <div class="top-row">
+      <h1>Dashboard</h1>
+      <div class="top-right">
+        <button id="menuBtn" class="menu-btn" aria-label="Open menu">
+          <span></span><span></span><span></span>
+        </button>
+        <span id="todayDate" class="date"></span>
       </div>
     </div>
-    <div class="sub">Welcome back Brian</div>
-    <div class="stitch"></div>
+    <p id="welcomeNote" class="welcome">Welcome</p>
+    <div class="dashes"></div>
   </header>
+
+  <!-- MENU FILE (slides in when you tap the three lines) -->
+  <div id="overlay" class="overlay"></div>
+  <aside id="menuPanel" class="panel" aria-hidden="true">
+    <div class="panel-head">
+      <h2>Menu</h2>
+      <button id="closeBtn" class="close-btn" aria-label="Close">&times;</button>
+    </div>
+
+    <section class="card">
+      <h3>Referrals</h3>
+      <p>Share your link. Friends join straight away, no confirmation needed.</p>
+      <input id="refLink" type="text" readonly>
+      <button id="copyRef" class="gold-btn">Copy link</button>
+      <button id="shareRef" class="gold-btn alt">Share</button>
+    </section>
+
+    <section class="card contact">
+      <h3>Contact</h3>
+      <p>Phone: <a href="tel:0717662799">0717662799</a></p>
+      <p>Facebook: <strong>@yobbie lastking</strong></p>
+    </section>
+
+    <button id="logoutBtn" class="logout">Log out</button>
+  </aside>
+
+  <main class="content">
+    <!-- Your dashboard content goes here -->
+  </main>
+
+  <script src="script.js"></script>
+</body>
 
   <div class="summary-strip">
     <div class="sum-card owed">
