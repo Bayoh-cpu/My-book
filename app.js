@@ -1,3 +1,11 @@
+// =====================================================
+// ONLINE BACKUP (Supabase)
+// Paste your two Supabase details between the quotes.
+// Leave them empty and the app keeps working on this phone only.
+// =====================================================
+const SUPABASE_URL = '';        // e.g. https://abcdxyz.supabase.co
+const SUPABASE_ANON_KEY = '';   // the anon (public) key, never the secret key
+
 (function(){
   const STORAGE_KEY = 'people';
   let people = [];
@@ -36,6 +44,8 @@
   function savePeople(){
     try{
       localStorage.setItem(STORAGE_KEY, JSON.stringify(people));
+      stampData();
+      scheduleCloudPush();
     }catch(e){
       showToast('Could not save — storage may be full or blocked');
     }
@@ -67,7 +77,30 @@
     document.getElementById('totalCleared').textContent = fmt(totalCleared);
   }
 
+  function renderDashboard(){
+    const acc = getAccount() || {};
+    const biz = (acc.business || '').trim() || (acc.name ? acc.name.trim().split(' ')[0] : '') || 'there';
+    document.getElementById('dashBiz').textContent = biz;
+    document.getElementById('dashWelcome').textContent = acc.business
+      ? "Welcome back! Here's your debt book for today."
+      : "Welcome back! Add your hotel or shop name in ⚙ Settings.";
+
+    const total = people.length;
+    let owing = 0;
+    people.forEach(p => { if(personTotals(p).outstanding > 0) owing++; });
+    document.getElementById('chipPeople').textContent = total + (total === 1 ? ' customer' : ' customers');
+    document.getElementById('chipOwing').textContent = owing + ' with balance';
+    document.getElementById('chipCleared').textContent = (total - owing) + ' settled';
+
+    // nudge a backup when there is data and no backup in the last 7 days
+    const last = Number(localStorage.getItem('deni_book_last_backup') || 0);
+    const stale = !last || (Date.now() - last) > 7 * 24 * 60 * 60 * 1000;
+    document.getElementById('chipBackup').classList.toggle('hidden-chip', !(total > 0 && stale && !hasCloud()));
+    renderCloudChip();
+  }
+
   function render(){
+    renderDashboard();
     const q = searchBox.value.trim().toLowerCase();
     const filtered = people.filter(p => p.name.toLowerCase().includes(q));
     renderSummary(filtered);
@@ -409,6 +442,7 @@
   const authForgotRow = document.getElementById('authForgotRow');
   const authSubmit = document.getElementById('authSubmit');
   const authName = document.getElementById('authName');
+  const authBiz = document.getElementById('authBiz');
   const authPhone = document.getElementById('authPhone');
   const authEmail = document.getElementById('authEmail');
   const authPassword = document.getElementById('authPassword');
@@ -460,7 +494,7 @@
 
   function authErr(id, msg){ document.getElementById(id).textContent = msg || ''; }
   function clearAuthErrors(){
-    ['authNameError','authPhoneError','authEmailError','authPassError','authOtpError'].forEach(id => authErr(id, ''));
+    ['authNameError','authBizError','authPhoneError','authEmailError','authPassError','authOtpError'].forEach(id => authErr(id, ''));
   }
 
   function getEmailConfig(){
@@ -533,6 +567,7 @@
 
   function unlockApp(){
     touchSession(true);
+    renderDashboard();
     authView.classList.add('a-gone');
     authPassword.value = '';
     authPassword.type = 'password';
@@ -540,16 +575,41 @@
     authOtp.value = '';
   }
 
-  function lockApp(){
+  function lockApp(full){
     clearSession();
+    if(full && hasCloud()){
+      // send the last changes online, then forget the online login on this phone
+      clearTimeout(pushTimer);
+      cloudPush().then(()=> setCloudSession(null), ()=> setCloudSession(null));
+    }
     authView.classList.remove('a-gone');
     initAuth();
   }
 
   async function finishRegistration(info){
+    // create (or link) the online account first, when online backup is switched on
+    if(CLOUD_ON){
+      authSubmit.textContent = 'Creating account...';
+      const failBack = (msg)=>{ setAuthMode('register'); authErr('authEmailError', msg); return false; };
+      const up = await cloudSignUp(info.email, info.password, { name: info.name, business: info.business, phone: info.phone });
+      if(up.ok){
+        setCloudSession(up.session);
+      } else if(up.exists){
+        const inn = await cloudSignIn(info.email, info.password);
+        if(inn.ok){ setCloudSession(inn.session); }
+        else { return failBack('This email already has an account. Use Login, or Forgot Password.'); }
+      } else if(up.needsConfirm){
+        return failBack('Almost done: check your email to confirm your account, then Login.');
+      } else if(up.network){
+        // offline: create it on this phone now, it links online at the next login
+      } else {
+        return failBack(up.error || 'Could not create the online account. Try again.');
+      }
+    }
     const existing = getAccount();
     saveAccount({
       name: info.name,
+      business: info.business || (existing && existing.business) || '',
       phone: info.phone,
       email: info.email,
       passHash: info.passHash,
@@ -560,6 +620,8 @@
     pendingSignup = null;
     unlockApp();
     showToast('Welcome, ' + info.name.split(' ')[0]);
+    if(hasCloud()) cloudReconcile();
+    return true;
   }
 
   authForm.addEventListener('submit', async (e)=>{
@@ -588,7 +650,9 @@
     if(authMode === 'register'){
       const name = authName.value.trim();
       const phone = normPhone(authPhone.value.trim());
+      const business = authBiz.value.trim();
       if(name.length < 2){ authErr('authNameError', 'Enter your full name.'); ok = false; }
+      if(business.length < 2){ authErr('authBizError', 'Enter your hotel or shop name.'); ok = false; }
       if(!phoneOK(phone)){ authErr('authPhoneError', 'Enter a valid Safaricom number.'); ok = false; }
       if(!ok) return;
 
@@ -604,7 +668,7 @@
 
       authSubmit.disabled = true;
       const passHash = await hashPassword(password);
-      const info = { name, phone, email, passHash };
+      const info = { name, business, phone, email, passHash, password };
 
       // If EmailJS is set up, confirm the email with an OTP first
       if(hasEmailConfig()){
@@ -636,16 +700,79 @@
     // ----- Login -----
     if(!ok) return;
     const acc = getAccount();
-    if(!acc){ authErr('authEmailError', 'No account found. Please register first.'); return; }
+    const emailMatch = !!(acc && acc.email && acc.email.toLowerCase() === email.toLowerCase());
+    let offline = false;
+
+    if(CLOUD_ON){
+      authSubmit.disabled = true;
+      authSubmit.textContent = 'Signing in...';
+      const inn = await cloudSignIn(email, password);
+      authSubmit.disabled = false;
+      authSubmit.textContent = 'Login';
+
+      if(inn.ok){
+        setCloudSession(inn.session);
+        const meta = inn.session.meta || {};
+        const passHash = await hashPassword(password);
+        if(!emailMatch){
+          // a new phone (or another account): build the local account from the online one
+          if(acc){
+            try{ localStorage.removeItem(STORAGE_KEY); localStorage.removeItem(DATA_STAMP_KEY); }catch(e){}
+            people = [];
+          }
+          saveAccount({
+            name: meta.name || '',
+            business: meta.business || '',
+            phone: meta.phone || '',
+            email: inn.session.email || email,
+            passHash: passHash,
+            createdAt: Date.now()
+          });
+        } else {
+          acc.passHash = passHash;   // keep this phone's password in step with the online one
+          saveAccount(acc);
+        }
+        unlockApp();
+        cloudReconcile();
+        return;
+      }
+
+      if(inn.network){
+        offline = true;
+      } else {
+        // the online account said no: maybe an older phone-only account that needs linking
+        if(emailMatch && acc.passHash && await verifyPassword(password)){
+          const up = await cloudSignUp(email, password, { name: acc.name, business: acc.business, phone: acc.phone });
+          if(up.ok){
+            setCloudSession(up.session);
+            unlockApp();
+            cloudReconcile();
+            showToast('Online backup is now on');
+            return;
+          }
+          unlockApp();
+          showToast('Logged in. Online backup is not linked: the password differs from the online account.');
+          return;
+        }
+        authErr('authPassError', 'Wrong email or password.');
+        return;
+      }
+    }
+
+    // local login (online backup off, or no internet)
+    if(!acc){
+      authErr('authEmailError', offline ? 'No internet connection. Connect to log in on this phone.' : 'No account found. Please register first.');
+      return;
+    }
     if(!acc.passHash){
       authErr('authEmailError', 'Please register once to set a password.');
       return;
     }
     authSubmit.disabled = true;
-    const emailMatch = acc.email && acc.email.toLowerCase() === email.toLowerCase();
     const pwOk = await verifyPassword(password);
     authSubmit.disabled = false;
     if(!emailMatch || !pwOk){ authErr('authPassError', 'Wrong email or password.'); return; }
+    if(offline) showToast('No internet: showing the book saved on this phone');
     unlockApp();
   });
 
@@ -660,10 +787,12 @@
       setAuthMode('register');
       authEmail.value = acc.email || '';
       authName.value = acc.name || '';
+      authBiz.value = acc.business || '';
       authPhone.value = acc.phone || '';
       authSubtitle.textContent = 'Set a password to continue';
     } else {
-      setAuthMode('register');
+      setAuthMode(CLOUD_ON ? 'login' : 'register');
+      if(CLOUD_ON) authSubtitle.textContent = 'New phone? Login to restore your book';
     }
   }
 
@@ -675,6 +804,7 @@
   let resetStep = 'choice';
   let resetError = '';
   let resetCodeState = null; // { code, expiresAt }
+  let resetEmailSent = '';
 
   function resetTargetEmail(){
     const acc = getAccount();
@@ -690,7 +820,7 @@
   }
 
   function showResetScreen(){
-    resetStep = 'choice';
+    resetStep = CLOUD_ON ? 'cloudAsk' : 'choice';
     resetError = '';
     resetScreenEl.style.display = 'flex';
     renderResetStep();
@@ -700,7 +830,49 @@
     resetScreenEl.style.display = 'none';
   }
 
+  function renderCloudReset(){
+    if(resetStep === 'cloudAsk'){
+      const prefill = (authEmail.value || resetTargetEmail() || '').trim();
+      resetContentEl.innerHTML = `
+        <div class="lock-sub">Enter your account email. We will send you a link to set a new password.</div>
+        <div class="field" style="margin-top:12px;">
+          <label for="resetEmailInput">Email</label>
+          <input type="email" id="resetEmailInput" value="${escapeHtml(prefill)}" placeholder="you@example.com" autocomplete="email">
+        </div>
+        <div class="lock-error">${resetError || ''}</div>
+        <div class="sheet-actions" style="flex-direction:column; gap:10px;">
+          <button class="btn-primary" data-raction="cloudSend">Send reset link</button>
+          <button class="lock-reset-link" data-raction="close">Cancel</button>
+        </div>`;
+    } else if(resetStep === 'cloudSending'){
+      resetContentEl.innerHTML = `<div class="lock-sub" style="text-align:center; margin-top:16px;">Sending...</div>`;
+    } else if(resetStep === 'cloudSent'){
+      resetContentEl.innerHTML = `
+        <div class="lock-sub" style="text-align:center;">If that email has an account, a link is on its way to<br><strong style="color:var(--paper);">${escapeHtml(resetEmailSent)}</strong>.<br><br>Open the link on this phone. It brings you back here to set a new password.</div>
+        <div class="sheet-actions" style="flex-direction:column; gap:10px; margin-top:14px;">
+          <button class="btn-secondary" data-raction="cloudBack">Use a different email</button>
+          <button class="lock-reset-link" data-raction="close">Close</button>
+        </div>`;
+    } else if(resetStep === 'cloudNew'){
+      resetContentEl.innerHTML = `
+        <div class="lock-sub" style="text-align:center;">Set a new password.</div>
+        <div class="field" style="margin-top:14px;">
+          <label for="resetNewPw">New password</label>
+          <input type="password" id="resetNewPw" placeholder="At least 6 characters" autocomplete="new-password">
+        </div>
+        <div class="field">
+          <label for="resetConfirmPw">Confirm new password</label>
+          <input type="password" id="resetConfirmPw" placeholder="Enter it again" autocomplete="new-password">
+        </div>
+        <div class="lock-error">${resetError || ''}</div>
+        <div class="sheet-actions">
+          <button class="btn-primary" data-raction="cloudSave" style="width:100%;">Save new password</button>
+        </div>`;
+    }
+  }
+
   function renderResetStep(){
+    if(resetStep.indexOf('cloud') === 0){ renderCloudReset(); return; }
     const email = resetTargetEmail();
     const canEmail = !!(email && hasEmailConfig() && getAccount());
 
@@ -753,7 +925,52 @@
     if(!btn || btn.disabled) return;
     const action = btn.getAttribute('data-raction');
 
-    if(action === 'close'){
+    if(action === 'cloudSend'){
+      const em = (document.getElementById('resetEmailInput').value || '').trim();
+      if(!emailOK(em)){ resetError = 'Enter a valid email address'; renderResetStep(); return; }
+      resetStep = 'cloudSending';
+      renderResetStep();
+      try{
+        const r = await sbFetch('/auth/v1/recover', { method: 'POST', body: JSON.stringify({ email: em }) });
+        if(r.ok){ resetEmailSent = em; resetError = ''; resetStep = 'cloudSent'; }
+        else { resetError = errMsg(r.body) || 'Could not send the email. Try again later.'; resetStep = 'cloudAsk'; }
+      }catch(e){
+        resetError = 'No internet connection.';
+        resetStep = 'cloudAsk';
+      }
+      renderResetStep();
+    } else if(action === 'cloudBack'){
+      resetError = '';
+      resetStep = 'cloudAsk';
+      renderResetStep();
+    } else if(action === 'cloudSave'){
+      const p1 = document.getElementById('resetNewPw').value;
+      const p2 = document.getElementById('resetConfirmPw').value;
+      if(p1.length < 6){ resetError = 'Password must be at least 6 characters'; renderResetStep(); return; }
+      if(p1 !== p2){ resetError = "Passwords didn't match"; renderResetStep(); return; }
+      try{
+        const r = await sbFetch('/auth/v1/user', { method: 'PUT', body: JSON.stringify({ password: p1 }) }, recoveryToken);
+        if(r.ok){
+          const em = (r.body && r.body.email) || '';
+          const acc = getAccount();
+          if(acc && acc.email && em && acc.email.toLowerCase() === em.toLowerCase()){
+            acc.passHash = await hashPassword(p1);
+            saveAccount(acc);
+          }
+          recoveryToken = null;
+          hideResetScreen();
+          if(em) authEmail.value = em;
+          setAuthMode('login');
+          showToast('Password updated. Please login.');
+        } else {
+          resetError = errMsg(r.body) || 'Could not update the password. The link may have expired.';
+          renderResetStep();
+        }
+      }catch(e){
+        resetError = 'No internet connection.';
+        renderResetStep();
+      }
+    } else if(action === 'close'){
       hideResetScreen();
     } else if(action === 'sendCode' || action === 'resend'){
       resetStep = 'sending';
@@ -856,14 +1073,369 @@
     if(!b) return;
     const act = b.getAttribute('data-saction');
     settingsSheet.classList.remove('open');
-    if(act === 'changePassword'){
+    if(act === 'backup'){
+      openBackupSheet();
+    } else if(act === 'businessName'){
+      openBizSheet();
+    } else if(act === 'changePassword'){
       requestPinFor('changeVerify');
     } else if(act === 'resetEmail'){
       openEmailConfigSheet();
     } else if(act === 'logout'){
-      lockApp();
+      lockApp(true);
     }
   });
+
+  // ---------- Online backup (Supabase) ----------
+  const CLOUD_ON = !!(SUPABASE_URL && SUPABASE_ANON_KEY);
+  const CLOUD_SESSION_KEY = 'deni_cloud_session';
+  const DATA_STAMP_KEY = 'deni_data_updated';   // when the book on this phone last changed
+  const CLOUD_SYNC_KEY = 'deni_cloud_synced';   // last successful online sync
+  let cloudState = 'off';                       // off | synced | pending | offline
+  let pushTimer = null;
+  let recoveryToken = null;
+
+  function getCloudSession(){
+    try{ return JSON.parse(localStorage.getItem(CLOUD_SESSION_KEY) || 'null'); }catch(e){ return null; }
+  }
+  function setCloudSession(s){
+    if(s) localStorage.setItem(CLOUD_SESSION_KEY, JSON.stringify(s));
+    else localStorage.removeItem(CLOUD_SESSION_KEY);
+    renderCloudChip();
+  }
+  function hasCloud(){ return CLOUD_ON && !!getCloudSession(); }
+  function stampData(){ localStorage.setItem(DATA_STAMP_KEY, String(Date.now())); }
+  function dataStamp(){ return Number(localStorage.getItem(DATA_STAMP_KEY) || 0); }
+
+  function errMsg(body){
+    if(!body) return '';
+    return String(body.msg || body.error_description || body.message || body.error || '');
+  }
+
+  async function sbFetch(path, opts, token){
+    const headers = Object.assign({ apikey: SUPABASE_ANON_KEY, 'Content-Type': 'application/json' }, (opts && opts.headers) || {});
+    if(token) headers.Authorization = 'Bearer ' + token;
+    const res = await fetch(SUPABASE_URL.replace(/\/+$/, '') + path, Object.assign({}, opts, { headers }));
+    let body = null;
+    try{ body = await res.json(); }catch(e){}
+    return { ok: res.ok, status: res.status, body };
+  }
+
+  function sessionFromAuth(body){
+    const u = body.user || {};
+    return {
+      access_token: body.access_token,
+      refresh_token: body.refresh_token,
+      expires_at: body.expires_at || (Math.floor(Date.now() / 1000) + (body.expires_in || 3600)),
+      user_id: u.id,
+      email: u.email,
+      meta: u.user_metadata || {}
+    };
+  }
+
+  async function cloudSignIn(email, password){
+    try{
+      const r = await sbFetch('/auth/v1/token?grant_type=password', { method: 'POST', body: JSON.stringify({ email, password }) });
+      if(r.ok && r.body && r.body.access_token) return { ok: true, session: sessionFromAuth(r.body) };
+      return { ok: false, status: r.status, error: errMsg(r.body) };
+    }catch(e){
+      return { ok: false, network: true };
+    }
+  }
+
+  async function cloudSignUp(email, password, meta){
+    try{
+      const r = await sbFetch('/auth/v1/signup', { method: 'POST', body: JSON.stringify({ email, password, data: meta }) });
+      if(r.ok && r.body && r.body.access_token) return { ok: true, session: sessionFromAuth(r.body) };
+      if(r.ok && r.body){
+        // no session came back: email already used (hidden), or email confirmation is required
+        const hidden = Array.isArray(r.body.identities) && r.body.identities.length === 0;
+        return hidden ? { ok: false, exists: true } : { ok: false, needsConfirm: true };
+      }
+      const msg = errMsg(r.body).toLowerCase();
+      if(msg.indexOf('already') !== -1) return { ok: false, exists: true };
+      return { ok: false, error: errMsg(r.body) };
+    }catch(e){
+      return { ok: false, network: true };
+    }
+  }
+
+  // returns a session with a valid access token, refreshing it when it is about to expire
+  async function cloudToken(){
+    let s = getCloudSession();
+    if(!s) return null;
+    if(s.expires_at - 60 > Date.now() / 1000) return s;
+    try{
+      const r = await sbFetch('/auth/v1/token?grant_type=refresh_token', { method: 'POST', body: JSON.stringify({ refresh_token: s.refresh_token }) });
+      if(r.ok && r.body && r.body.access_token){
+        s = Object.assign({}, s, sessionFromAuth(r.body));
+        setCloudSession(s);
+        return s;
+      }
+      if(r.status === 400 || r.status === 401) setCloudSession(null);   // login expired for good
+    }catch(e){}
+    return null;
+  }
+
+  function renderCloudChip(){
+    const chip = document.getElementById('chipCloud');
+    if(!chip) return;
+    if(!hasCloud()){ chip.classList.add('hidden-chip'); return; }
+    chip.classList.remove('hidden-chip', 'is-pending', 'is-offline');
+    if(cloudState === 'pending'){ chip.textContent = '☁ Syncing...'; chip.classList.add('is-pending'); }
+    else if(cloudState === 'offline'){ chip.textContent = '☁ Not synced yet'; chip.classList.add('is-offline'); }
+    else { chip.textContent = '☁ Synced'; }
+  }
+  function setCloudState(state){
+    cloudState = state;
+    renderCloudChip();
+  }
+
+  async function cloudPush(){
+    if(!hasCloud()) return false;
+    const s = await cloudToken();
+    if(!s){ setCloudState('offline'); return false; }
+    const acc = getAccount() || {};
+    const row = {
+      user_id: s.user_id,
+      data: { people: people, business: acc.business || '', stamp: dataStamp() || Date.now() },
+      updated_at: new Date().toISOString()
+    };
+    try{
+      const r = await sbFetch('/rest/v1/books?on_conflict=user_id', {
+        method: 'POST',
+        headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+        body: JSON.stringify(row)
+      }, s.access_token);
+      if(r.ok){
+        localStorage.setItem(CLOUD_SYNC_KEY, String(Date.now()));
+        setCloudState('synced');
+        return true;
+      }
+    }catch(e){}
+    setCloudState('offline');
+    return false;
+  }
+
+  async function cloudPull(){
+    const s = await cloudToken();
+    if(!s) return { ok: false };
+    try{
+      const r = await sbFetch('/rest/v1/books?select=data,updated_at&limit=1', { method: 'GET' }, s.access_token);
+      if(r.ok && Array.isArray(r.body)) return { ok: true, row: r.body[0] || null };
+    }catch(e){}
+    return { ok: false };
+  }
+
+  function applyCloudData(d, stamp){
+    if(people.length){
+      try{ localStorage.setItem('people_before_restore', JSON.stringify(people)); }catch(e){}
+    }
+    people = d.people
+      .filter(p => p && typeof p.name === 'string' && p.id)
+      .map(p => Object.assign({}, p, { items: p.items || [] }));
+    try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(people)); }catch(e){}
+    localStorage.setItem(DATA_STAMP_KEY, String(stamp));
+    const acc = getAccount();
+    if(acc && d.business && acc.business !== d.business){ acc.business = d.business; saveAccount(acc); }
+    render();
+  }
+
+  // Compare this phone with the online copy: the newer one wins.
+  async function cloudReconcile(){
+    if(!hasCloud()) return;
+    setCloudState('pending');
+    const res = await cloudPull();
+    if(!res.ok){ setCloudState('offline'); return; }
+    const d = res.row && res.row.data;
+    const cloudHas = !!(d && Array.isArray(d.people));
+    const cloudStamp = cloudHas ? (Number(d.stamp) || Date.parse(res.row.updated_at) || 0) : 0;
+    if(cloudHas && cloudStamp > dataStamp()){
+      applyCloudData(d, cloudStamp);
+      localStorage.setItem(CLOUD_SYNC_KEY, String(Date.now()));
+      setCloudState('synced');
+      showToast('Your book was restored from online backup');
+    } else {
+      await cloudPush();
+    }
+  }
+
+  function scheduleCloudPush(){
+    if(!hasCloud()) return;
+    setCloudState('pending');
+    clearTimeout(pushTimer);
+    pushTimer = setTimeout(()=>{ cloudPush(); }, 1500);
+  }
+
+  window.addEventListener('online', ()=>{
+    if(hasCloud() && cloudState !== 'synced') cloudReconcile();
+  });
+
+  // The reset-password email link brings people back here with a token in the address
+  function checkRecoveryLink(){
+    if(!CLOUD_ON || !location.hash || location.hash.length < 2) return;
+    const params = new URLSearchParams(location.hash.replace(/^#/, ''));
+    const clean = ()=>{ try{ history.replaceState(null, '', location.pathname + location.search); }catch(e){} };
+    if(params.get('error_description')){
+      clean();
+      showToast('That reset link has expired. Please ask for a new one.');
+      return;
+    }
+    if(params.get('type') === 'recovery' && params.get('access_token')){
+      recoveryToken = params.get('access_token');
+      clean();
+      resetStep = 'cloudNew';
+      resetError = '';
+      resetScreenEl.style.display = 'flex';
+      renderResetStep();
+    }
+  }
+
+  // ---------- Backup and restore ----------
+  const LAST_BACKUP_KEY = 'deni_book_last_backup';
+  const backupSheet = document.getElementById('backupSheetBackdrop');
+  const restoreFile = document.getElementById('restoreFile');
+
+  function refreshCloudLine(){
+    const line = document.getElementById('cloudLine');
+    const row = document.getElementById('syncRow');
+    const note = document.getElementById('backupNote');
+    if(!CLOUD_ON){
+      line.textContent = 'Online backup is not set up yet.';
+      row.style.display = 'none';
+      return;
+    }
+    if(!hasCloud()){
+      line.textContent = 'Online backup is off on this phone. Log in with internet to turn it on.';
+      row.style.display = 'none';
+      return;
+    }
+    const last = Number(localStorage.getItem(CLOUD_SYNC_KEY) || 0);
+    line.textContent = '☁ Online backup is ON · ' + (last
+      ? 'Last synced: ' + new Date(last).toLocaleString('en-KE', {day:'numeric', month:'short', hour:'2-digit', minute:'2-digit'})
+      : 'not synced yet');
+    row.style.display = 'flex';
+    note.textContent = 'Your book is also saved online. To use it on another phone, log in with the same email and password. You can still download a file copy below.';
+  }
+
+  function refreshBackupLabel(){
+    refreshCloudLine();
+    const last = Number(localStorage.getItem(LAST_BACKUP_KEY) || 0);
+    document.getElementById('backupLast').textContent = last
+      ? 'Last backup: ' + new Date(last).toLocaleString('en-KE', {day:'numeric', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit'})
+      : 'No backup yet';
+  }
+  function openBackupSheet(){
+    refreshBackupLabel();
+    backupSheet.classList.add('open');
+  }
+  document.getElementById('chipBackup').addEventListener('click', openBackupSheet);
+  document.getElementById('closeBackup').addEventListener('click', ()=> backupSheet.classList.remove('open'));
+  backupSheet.addEventListener('click', (e)=>{ if(e.target === backupSheet) backupSheet.classList.remove('open'); });
+
+  document.getElementById('downloadBackup').addEventListener('click', ()=>{
+    const acc = getAccount() || {};
+    const data = {
+      app: 'deni-book',
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      business: acc.business || '',
+      people: people
+    };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'deni-book-backup-' + new Date().toISOString().slice(0, 10) + '.json';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(()=> URL.revokeObjectURL(url), 3000);
+    localStorage.setItem(LAST_BACKUP_KEY, String(Date.now()));
+    refreshBackupLabel();
+    renderDashboard();
+    showToast('Backup downloaded');
+  });
+
+  document.getElementById('chooseRestore').addEventListener('click', ()=> restoreFile.click());
+
+  document.getElementById('syncNow').addEventListener('click', async ()=>{
+    const btn = document.getElementById('syncNow');
+    btn.disabled = true;
+    btn.textContent = 'Syncing...';
+    await cloudReconcile();
+    btn.disabled = false;
+    btn.textContent = 'Sync now';
+    refreshBackupLabel();
+    showToast(cloudState === 'synced' ? 'Synced' : 'Could not sync. Check your internet.');
+  });
+
+  restoreFile.addEventListener('change', ()=>{
+    const file = restoreFile.files && restoreFile.files[0];
+    if(!file) return;
+    const reader = new FileReader();
+    reader.onerror = ()=>{ showToast('Could not read that file'); };
+    reader.onload = ()=>{
+      let list = null, biz = '';
+      try{
+        const parsed = JSON.parse(reader.result);
+        list = Array.isArray(parsed) ? parsed : (parsed && parsed.app === 'deni-book' ? parsed.people : null);
+        biz = (parsed && parsed.business) || '';
+      }catch(e){ list = null; }
+
+      const valid = Array.isArray(list) && list.every(p => p && typeof p.name === 'string' && p.id && (p.items === undefined || Array.isArray(p.items)));
+      if(!valid){ showToast('That is not a Deni Book backup file'); restoreFile.value = ''; return; }
+
+      const msg = 'Replace the ' + people.length + ' people on this phone with the ' + list.length + ' from this backup?';
+      if(!confirm(msg)){ restoreFile.value = ''; return; }
+
+      // keep a safety copy of what was here before
+      try{ localStorage.setItem('people_before_restore', JSON.stringify(people)); }catch(e){}
+
+      people = list.map(p => Object.assign({}, p, { items: p.items || [] }));
+      savePeople();
+
+      const acc = getAccount();
+      if(acc && !acc.business && biz){ acc.business = biz; saveAccount(acc); }
+
+      render();
+      backupSheet.classList.remove('open');
+      restoreFile.value = '';
+      showToast('Restored ' + people.length + (people.length === 1 ? ' person' : ' people'));
+    };
+    reader.readAsText(file);
+  });
+
+  // ---------- Business name sheet ----------
+  const bizSheet = document.getElementById('bizSheetBackdrop');
+  const bizInput = document.getElementById('bizInput');
+  const bizError = document.getElementById('bizError');
+  function openBizSheet(){
+    const acc = getAccount() || {};
+    bizInput.value = acc.business || '';
+    bizError.textContent = '';
+    bizSheet.classList.add('open');
+    setTimeout(()=> bizInput.focus(), 50);
+  }
+  document.getElementById('cancelBiz').addEventListener('click', ()=> bizSheet.classList.remove('open'));
+  bizSheet.addEventListener('click', (e)=>{ if(e.target === bizSheet) bizSheet.classList.remove('open'); });
+  document.getElementById('saveBiz').addEventListener('click', ()=>{
+    const val = bizInput.value.trim();
+    if(val.length < 2){ bizError.textContent = 'Enter your hotel or shop name'; return; }
+    const acc = getAccount();
+    if(!acc) return;
+    acc.business = val;
+    saveAccount(acc);
+    renderDashboard();
+    bizSheet.classList.remove('open');
+    showToast('Business name saved');
+  });
+
+  // ---------- Coming soon sheet ----------
+  const soonSheet = document.getElementById('soonSheetBackdrop');
+  document.getElementById('soonBtn').addEventListener('click', ()=> soonSheet.classList.add('open'));
+  document.getElementById('closeSoon').addEventListener('click', ()=> soonSheet.classList.remove('open'));
+  soonSheet.addEventListener('click', (e)=>{ if(e.target === soonSheet) soonSheet.classList.remove('open'); });
 
   // ---------- Reset email config sheet ----------
   const emailConfigSheet = document.getElementById('emailConfigSheetBackdrop');
@@ -943,7 +1515,19 @@
       if(newPw !== confirmPw){ pinSheetError.textContent = "Passwords didn't match"; return; }
       await setStoredPassword(newPw);
       closePinSheet();
-      showToast('Password updated');
+      if(hasCloud()){
+        let updated = false;
+        const s = await cloudToken();
+        if(s){
+          try{
+            const r = await sbFetch('/auth/v1/user', { method: 'PUT', body: JSON.stringify({ password: newPw }) }, s.access_token);
+            updated = r.ok;
+          }catch(e){}
+        }
+        showToast(updated ? 'Password updated' : 'Changed on this phone only. Connect to the internet and change it again to update online.');
+      } else {
+        showToast('Password updated');
+      }
     }
   });
 
@@ -963,5 +1547,8 @@
   document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) checkAutoLock(); });
 
   loadPeople();
+  checkRecoveryLink();
+  window.addEventListener('hashchange', checkRecoveryLink);
+  if(hasCloud()) cloudReconcile();
 
 })();
